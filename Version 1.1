@@ -1,0 +1,239 @@
+import MetaTrader5 as mt5
+import pandas as pd
+from datetime import datetime, timedelta
+import time
+import pytz
+
+def connect_mt5(account, password, server):
+    """Connect to MT5 platform"""
+    if not mt5.initialize():
+        print("MT5 initialization failed")
+        return False
+    
+    authorized = mt5.login(account, password=password, server=server)
+    if not authorized:
+        print("MT5 login failed")
+        mt5.shutdown()
+        return False
+    
+    print("Connected to MT5 successfully")
+    return True
+
+def get_5min_momentum(symbol):
+    """
+    Analyze first 5 minutes of trading to determine momentum direction
+    Returns: Dictionary with momentum analysis
+    """
+    # Get market open time (9:30 AM ET)
+    et_tz = pytz.timezone('US/Eastern')
+    now = datetime.now(et_tz)
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    
+    # Convert to UTC for MT5
+    market_open_utc = market_open.astimezone(pytz.UTC)
+    
+    # Get the 5-minute candle data
+    rates = mt5.copy_rates_from(symbol, mt5.TIMEFRAME_M1, market_open_utc, 5)
+    if rates is None or len(rates) == 0:
+        return None
+    
+    df = pd.DataFrame(rates)
+    
+    # Calculate momentum metrics
+    open_price = df['open'].iloc[0]
+    close_price = df['close'].iloc[-1]
+    high = df['high'].max()
+    low = df['low'].min()
+    volume = df['tick_volume'].sum()
+    
+    # Calculate momentum indicators
+    price_change = close_price - open_price
+    range_size = high - low
+    avg_volume = volume / 5
+    
+    momentum = {
+        'direction': 'BUY' if price_change > 0 else 'SELL',
+        'price_change': abs(price_change),
+        'range_size': range_size,
+        'strength': abs(price_change)/range_size if range_size != 0 else 0,
+        'open': open_price,
+        'close': close_price,
+        'high': high,
+        'low': low,
+        'avg_volume': avg_volume
+    }
+    
+    print(f"\nOpening 5-Minute Momentum Analysis:")
+    print(f"Direction: {momentum['direction']}")
+    print(f"Price Change: {momentum['price_change']:.2f}")
+    print(f"Range Size: {momentum['range_size']:.2f}")
+    print(f"Strength: {momentum['strength']:.2f}")
+    print(f"Average Volume: {momentum['avg_volume']:.0f}")
+    
+    return momentum
+
+def calculate_trade_levels(symbol, momentum):
+    """Calculate entry, stop loss, and take profit levels"""
+    tick = mt5.symbol_info_tick(symbol)
+    
+    # Define ATR-style range for dynamic stops
+    range_size = momentum['range_size']
+    
+    if momentum['direction'] == 'BUY':
+        entry_price = tick.ask
+        stop_loss = entry_price - (range_size * 1.5)  # 1.5x range size for stop loss
+        take_profit = entry_price + (range_size * 2)  # 2x range size for take profit
+    else:
+        entry_price = tick.bid
+        stop_loss = entry_price + (range_size * 1.5)  # 1.5x range size for stop loss
+        take_profit = entry_price - (range_size * 2)  # 2x range size for take profit
+    
+    return entry_price, stop_loss, take_profit
+
+def place_trade(symbol, momentum, risk_percent=1.0):
+    """Place trade based on momentum with stop loss and take profit"""
+    symbol_info = mt5.symbol_info(symbol)
+    point = symbol_info.point
+    
+    # Calculate trade levels
+    entry_price, stop_loss, take_profit = calculate_trade_levels(symbol, momentum)
+    
+    # Calculate position size based on risk
+    account_info = mt5.account_info()
+    risk_amount = account_info.equity * (risk_percent / 100)
+    sl_points = abs(entry_price - stop_loss) / point
+    position_size = risk_amount / sl_points
+    
+    # Round position size to acceptable lot size
+    lot_step = symbol_info.volume_step
+    position_size = round(position_size / lot_step) * lot_step
+    
+    order_type = mt5.ORDER_TYPE_BUY if momentum['direction'] == 'BUY' else mt5.ORDER_TYPE_SELL
+    
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": position_size,
+        "type": order_type,
+        "price": entry_price,
+        "sl": stop_loss,
+        "tp": take_profit,
+        "deviation": 20,
+        "magic": 234000,
+        "comment": "5min Momentum 1hr Trade",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    
+    result = mt5.order_send(request)
+    
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        print("\nTrade executed successfully:")
+        print(f"Direction: {momentum['direction']}")
+        print(f"Entry Price: {entry_price:.2f}")
+        print(f"Stop Loss: {stop_loss:.2f}")
+        print(f"Take Profit: {take_profit:.2f}")
+        print(f"Position Size: {position_size}")
+        return result.order
+    else:
+        print(f"Order failed, return code: {result.retcode}")
+        return None
+
+def close_position(symbol, order_number):
+    """Close the position by order number"""
+    position = mt5.positions_get(ticket=order_number)
+    if not position:
+        print("Position not found")
+        return False
+    
+    position = position[0]
+    
+    # Determine close parameters based on position type
+    if position.type == mt5.POSITION_TYPE_BUY:
+        order_type = mt5.ORDER_TYPE_SELL
+        price = mt5.symbol_info_tick(symbol).bid
+    else:
+        order_type = mt5.ORDER_TYPE_BUY
+        price = mt5.symbol_info_tick(symbol).ask
+    
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": position.volume,
+        "type": order_type,
+        "position": order_number,
+        "price": price,
+        "deviation": 20,
+        "magic": 234000,
+        "comment": "Close 1hr Time Exit",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    
+    result = mt5.order_send(request)
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        print("Position closed successfully")
+        return True
+    else:
+        print(f"Position close failed, return code: {result.retcode}")
+        return False
+
+def run_strategy(symbol, account, password, server):
+    """Main strategy execution"""
+    print(f"\nStarting 5-minute momentum strategy for {symbol}")
+    
+    # Connect to MT5
+    if not connect_mt5(account, password, server):
+        return
+    
+    # Wait for market open (9:30 AM ET)
+    et_tz = pytz.timezone('US/Eastern')
+    et_now = datetime.now(et_tz)
+    market_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
+    
+    if et_now < market_open:
+        wait_seconds = (market_open - et_now).total_seconds()
+        print(f"Waiting {wait_seconds:.0f} seconds for market open...")
+        time.sleep(wait_seconds)
+    
+    # Wait for 5 minutes to complete
+    print("Collecting 5-minute price data...")
+    time.sleep(300)  # Wait 5 minutes
+    
+    # Analyze momentum and place trade
+    momentum = get_5min_momentum(symbol)
+    if momentum and momentum['strength'] > 0.3:  # Minimum strength threshold
+        order_number = place_trade(symbol, momentum)
+        
+        if order_number:
+            # Calculate exit time (1 hour after entry)
+            exit_time = datetime.now(et_tz) + timedelta(hours=1)
+            print(f"Trade will be closed at: {exit_time.strftime('%H:%M:%S')}")
+            
+            # Monitor position until exit time
+            while datetime.now(et_tz) < exit_time:
+                position = mt5.positions_get(ticket=order_number)
+                if not position:  # Position already closed (hit SL or TP)
+                    print("Position closed (Stop Loss or Take Profit hit)")
+                    break
+                time.sleep(1)
+            
+            # Force close if position still open
+            position = mt5.positions_get(ticket=order_number)
+            if position:
+                print("Time exit: Closing position after 1 hour")
+                close_position(symbol, order_number)
+    else:
+        print("Momentum not strong enough for trade")
+    
+    mt5.shutdown()
+    print("Strategy execution completed")
+
+if __name__ == "__main__":
+    # Trading configuration
+    SYMBOL = "AAPL"  # or any other symbol
+    ACCOUNT = "your_account_number"
+    PASSWORD = "your_password"
+    SERVER = "your_broker_server"
+    
+    run_strategy(SYMBOL, ACCOUNT, PASSWORD, SERVER)
